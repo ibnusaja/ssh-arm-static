@@ -10,6 +10,7 @@ on:
         description: "Versi OpenSSH portable"
         default: "10.0p2"
   push:
+    branches: [main]
     tags: ["v*"]
 
 env:
