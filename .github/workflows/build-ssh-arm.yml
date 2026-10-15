@@ -1,0 +1,124 @@
+name: Build static SSH client (ARM)
+
+on:
+  workflow_dispatch:
+    inputs:
+      dropbear_version:
+        description: "Versi Dropbear"
+        default: "2025.88"
+      openssh_version:
+        description: "Versi OpenSSH portable"
+        default: "10.0p2"
+  push:
+    tags: ["v*"]
+
+env:
+  DROPBEAR_VERSION: ${{ inputs.dropbear_version || '2025.88' }}
+  OPENSSH_VERSION: ${{ inputs.openssh_version || '10.0p2' }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        arch:
+          - { name: armv5-softfloat, triple: arm-linux-musleabi }
+          - { name: armv6-hardfloat, triple: armv6-linux-musleabihf }
+          - { name: armv7-hardfloat, triple: armv7l-linux-musleabihf }
+        tool: [dropbear, openssh]
+
+    steps:
+      - name: Install dependency host
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential bzip2 file qemu-user-static
+
+      - name: Download toolchain musl cross
+        run: |
+          curl -fsSL "https://musl.cc/${{ matrix.arch.triple }}-cross.tgz" | tar xz -C "$HOME"
+          echo "$HOME/${{ matrix.arch.triple }}-cross/bin" >> "$GITHUB_PATH"
+
+      # ---------------- Dropbear (dbclient) ----------------
+      - name: Build dbclient
+        if: matrix.tool == 'dropbear'
+        run: |
+          T=${{ matrix.arch.triple }}
+          curl -fsSLO "https://matt.ucc.asn.au/dropbear/releases/dropbear-${DROPBEAR_VERSION}.tar.bz2"
+          tar xf dropbear-*.tar.bz2
+          cd dropbear-${DROPBEAR_VERSION}
+          ./configure --host=$T \
+            --enable-static --disable-zlib \
+            --disable-lastlog --disable-utmp --disable-utmpx \
+            --disable-wtmp --disable-wtmpx \
+            --disable-pututline --disable-pututxline
+          make -j"$(nproc)" PROGRAMS="dbclient" STATIC=1
+          $T-strip dbclient
+          mkdir -p "$GITHUB_WORKSPACE/out"
+          cp dbclient "$GITHUB_WORKSPACE/out/dbclient-${{ matrix.arch.name }}"
+
+      # ---------------- OpenSSH (ssh) ----------------
+      - name: Build ssh
+        if: matrix.tool == 'openssh'
+        run: |
+          T=${{ matrix.arch.triple }}
+          curl -fsSLO "https://cdn.openbsd.org/pub/OpenBSD/OpenSSH/portable/openssh-${OPENSSH_VERSION}.tar.gz"
+          tar xf openssh-*.tar.gz
+          cd openssh-${OPENSSH_VERSION}
+          ./configure --host=$T \
+            --without-openssl --without-zlib \
+            --disable-security-key --disable-strip \
+            LDFLAGS="-static"
+          make -j"$(nproc)" ssh
+          $T-strip ssh
+          mkdir -p "$GITHUB_WORKSPACE/out"
+          cp ssh "$GITHUB_WORKSPACE/out/ssh-${{ matrix.arch.name }}"
+
+      - name: Verifikasi binary static
+        run: |
+          cd out
+          for f in *; do
+            echo "== $f"
+            file "$f"
+            ls -lh "$f"
+            # Tidak boleh ada dependensi shared lib
+            if readelf -d "$f" 2>/dev/null | grep -q NEEDED; then
+              echo "ERROR: $f masih dynamic"; exit 1
+            fi
+          done
+
+      - name: Smoke test (qemu, tidak fatal)
+        continue-on-error: true
+        run: |
+          cd out
+          for f in *; do
+            qemu-arm-static "./$f" -V || true
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.tool }}-${{ matrix.arch.name }}
+          path: out/*
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Buat checksum dan arsip gabungan
+        run: |
+          cd dist
+          sha256sum * > SHA256SUMS
+          tar czf ssh-static-arm-all.tar.gz $(ls | grep -v SHA256SUMS)
+          ls -lh
+      - uses: softprops/action-gh-release@v2
+        with:
+          # Rilis berisi: 6 binary terpisah + 1 arsip gabungan + checksum
+          files: |
+            dist/*
